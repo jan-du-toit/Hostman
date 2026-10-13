@@ -82,3 +82,13 @@ test('IPv6 loopback serves UDP and TCP AAAA queries',async()=>{
   try{for(const tcp of [false,true]){const reply=await exchange(makeQuery('v6.test',28),{address:'::1',port},1000,tcp);assert.equal(reply.readUInt16BE(6),1);assert.deepEqual(reply.subarray(-16),ipBytes('::1'));}}
   finally{await server.close();}
 });
+
+test('exact and wildcard blocks return NXDOMAIN and emit query metrics',async()=>{
+  const port=await freePort(),queries=[];const table=new Map([['blocked.test',['127.0.0.1']],['ok.test',['127.0.0.2']]]);
+  const server=await createDnsServer({table,config:{...config,blocks:['blocked.test','*.ads.test']},port,addresses:['127.0.0.1'],logger:()=>{},onQuery:event=>queries.push(event)});
+  try{
+    for(const name of ['blocked.test','ads.test','one.ads.test','deep.one.ads.test']){const reply=await exchange(makeQuery(name),{address:'127.0.0.1',port});assert.equal(reply[3]&15,3);}
+    const reply=await exchange(makeQuery('ok.test'),{address:'127.0.0.1',port});assert.equal(reply[3]&15,0);
+    assert.equal(queries.filter(q=>q.source==='blocked').length,4);assert.equal(queries.at(-1).source,'local');assert.ok(queries.every(q=>q.ms>=0));
+  }finally{await server.close();}
+});

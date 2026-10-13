@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { readFile, writeFile, mkdtemp, rm, access, appendFile, stat, rename } from 'node:fs/promises';
+import { readFile, writeFile, mkdtemp, rm, access, appendFile, stat, rename, mkdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -7,10 +7,12 @@ import readline from 'node:readline/promises';
 import { bridge, system, root } from '../lib/bridge.mjs';
 import { createDnsServer, readTable, makeQuery, exchange, answerAddresses } from '../lib/dns.mjs';
 import { update } from '../lib/update.mjs';
+import { uninstall } from '../lib/uninstall.mjs';
+import { paint,banner,info,success,hostTable } from '../lib/terminal.mjs';
+import { dnsSetup,checkDashboardPort } from '../lib/setup.mjs';
+import { serveDashboard } from '../lib/dashboard.mjs';
 
 const pkg=JSON.parse(await readFile(join(root,'package.json'),'utf8'));
-const color=process.stdout.isTTY && !process.env.NO_COLOR;
-const paint=(code,text)=>color?`\x1b[${code}m${text}\x1b[0m`:text;
 const help=`${paint(36,'Hostman '+pkg.version)} · ByDT Softwares · MIT License
 
 hostman                          Interactive menu
@@ -29,24 +31,31 @@ hostman import FILE --yes         Replace managed entries and config from JSON
 hostman backups                   List automatic backups
 hostman restore BACKUP-ID --yes   Restore the complete hosts/state snapshot
 hostman recover                   Recover an interrupted hosts transaction
+hostman dns setup                First-time DNS/dashboard setup wizard
 hostman dns status|enable|disable|start|stop|restart
 hostman dns upstream IP [IP ...]  Set explicit upstream DNS servers
+hostman dns config [--ttl N] [--timeout N] [--logging on|off]
+hostman dns block|unblock DOMAIN  Exact host or *.domain blocking
+hostman dns blocks               List DNS blocking rules
+hostman dashboard status|enable|disable|start|stop|restart
+hostman dashboard port NUMBER    Change dashboard port (default 8090)
 hostman dns lookup HOST [--type A|AAAA] [--tcp]
 hostman dns serve [--port N]      Foreground DNS server (normally a system service)
 hostman flush                     Clear the OS resolver cache
 hostman doctor                    Check dependencies, paths and local DNS
-hostman update [--check] [--ref main|TAG] [--yes]
+hostman update [--check] [--yes]  Install the latest Release ZIP
+hostman uninstall [--yes] [--remove-hosts]
 hostman version|help
 
-Writes require sudo on Fedora or an Administrator terminal on Windows.
+Writes require sudo on Fedora/Ubuntu or an Administrator terminal on Windows.
 DNS priority requires the platform installer first. DNS-changing commands
 are under the DNS menu. hostmanager is an alias for hostman.
 `;
 
 function parse(args) {
   const flags={},pos=[];
-  const values=new Set(['group','comment','ip','host','port','type','ref']);
-  const booleans=new Set(['all','json','yes','tcp','check','help']);
+  const values=new Set(['group','comment','ip','host','port','type','ref','ttl','timeout','logging']);
+  const booleans=new Set(['all','json','yes','tcp','check','help','remove-hosts']);
   for(let i=0;i<args.length;i++) {
     if(!args[i].startsWith('--')){pos.push(args[i]);continue;}
     const key=args[i].slice(2);
@@ -63,7 +72,7 @@ function out(result,json=false){if(json)console.log(JSON.stringify(result,null,2
 function list(flags={}) {
   const r=bridge('list');if(flags.json){console.log(JSON.stringify(r,null,2));return;}
   const rows=r.data.entries.map(e=>({host:e.host,ip:e.ip,group:e.group,state:e.enabled&&r.data.groups[e.group]?'on':'off',id:e.id}));
-  if(rows.length)console.table(rows);else console.log('No managed hosts yet. Try: hostman add app.test 127.0.0.1');
+  if(rows.length)hostTable(rows);else console.log('No managed hosts yet. Try: hostman add app.test 127.0.0.1');
   if(flags.all){console.log('Existing hosts outside the managed section:');console.table(r.unmanaged);}
 }
 async function serve(flags) {
@@ -76,7 +85,12 @@ async function serve(flags) {
     const line=new Date().toISOString()+' '+message+'\n';console.log(message);
     if(process.platform==='win32')try{const file=join(info.dataDir,'dns.log');if((await stat(file).catch(()=>({size:0}))).size>5*1024*1024)await rename(file,file+'.1').catch(()=>{});await appendFile(file,line);}catch{}
   };
-  const server=await createDnsServer({...current,port,logger:m=>void log(m)});
+  const metricsDir=process.env.HOSTMAN_DATA_DIR?join(info.dataDir,'runtime'):process.platform==='win32'?join(info.dataDir,'runtime'):'/run/hostman';
+  await mkdir(metricsDir,{recursive:true,mode:0o700});
+  const metrics={started:new Date().toISOString(),updated:new Date().toISOString(),counts:{total:0,local:0,upstream:0,blocked:0,failed:0},queries:[]};
+  const server=await createDnsServer({...current,port,logger:m=>void log(m),onQuery:event=>{metrics.counts.total++;metrics.counts[event.source]++;if(current.config.logging!==false){metrics.queries.push(event);if(metrics.queries.length>200)metrics.queries.shift();}}});
+  let writingMetrics=false;
+  const metricsTimer=setInterval(async()=>{if(writingMetrics)return;writingMetrics=true;try{metrics.updated=new Date().toISOString();if(current.config.logging===false)metrics.queries=[];const temporary=join(metricsDir,'dns-stats.new');await writeFile(temporary,JSON.stringify(metrics),{mode:0o600});await rename(temporary,join(metricsDir,'dns-stats.json'));}catch{}finally{writingMetrics=false;}},2000);
   await log('Hostman DNS listening on 127.0.0.1 and ::1, UDP/TCP port '+port);
   let reloading=false, lastError='';
   const timer=setInterval(async()=>{
@@ -88,7 +102,7 @@ async function serve(flags) {
     finally{reloading=false;}
   },1000);
   let closing=false;
-  async function stop(){if(closing)return;closing=true;clearInterval(timer);await server.close();process.exit(0);}
+  async function stop(){if(closing)return;closing=true;clearInterval(timer);clearInterval(metricsTimer);await server.close();process.exit(0);}
   process.once('SIGINT',stop);process.once('SIGTERM',stop);
 }
 function bridgeForServe() {
@@ -139,9 +153,17 @@ async function execute(args){
     case 'flush':count(tail,0);system(['flush']);break;
     case 'dns':{
       const [action,...rest]=tail;
-      if(['status','enable','disable','start','stop','restart'].includes(action)){count(rest,0);system([action]);}
+      if(action==='setup'){count(rest,0);await dnsSetup();}
+      else if(['status','enable','disable','start','stop','restart'].includes(action)){count(rest,0);if(action==='enable'&&process.stdin.isTTY&&!bridge('export').setupComplete)await dnsSetup();system([action]);}
       else if(action==='serve'){count(rest,0);await serve(flags);}
       else if(action==='upstream'){count(rest,1,5);out(bridge('dns-config',{upstreams:rest}));}
+      else if(action==='config'){
+        count(rest,0);const fields={};if(flags.ttl!==undefined)fields.ttl=Number(flags.ttl);if(flags.timeout!==undefined)fields.timeoutMs=Number(flags.timeout);
+        if(flags.logging!==undefined){if(!['on','off'].includes(flags.logging))throw new Error('Logging must be on or off.');fields.logging=flags.logging==='on';}
+        if(Object.keys(fields).length)out(bridge('dns-config',fields));else console.log(JSON.stringify(bridge('export').dns,null,2));
+      }
+      else if(['block','unblock'].includes(action)){count(rest,1);out(bridge('dns-'+action,{domain:rest[0]}));}
+      else if(action==='blocks'){count(rest,0);console.log((bridge('export').dns.blocks||[]).join('\n')||'No blocked domains.');}
       else if(action==='lookup'){
         count(rest,1);const type=(flags.type||'A').toUpperCase();if(!['A','AAAA'].includes(type))throw new Error('Type must be A or AAAA.');
         const reply=await exchange(makeQuery(rest[0],type==='A'?1:28),'127.0.0.1',5000,Boolean(flags.tcp));
@@ -150,6 +172,14 @@ async function execute(args){
         const addresses=answerAddresses(reply);if(addresses.length)console.table(addresses);else console.log('No address records for this hostname/type.');
       }else throw new Error('Run hostman help for DNS commands.');break;
     }
+    case 'dashboard':{
+      const [action,...rest]=tail;
+      if(action==='serve'){count(rest,0);await serveDashboard();}
+      else if(action==='port'){count(rest,1);const before=bridge('export');if(Number(rest[0])!==before.dashboard.port)await checkDashboardPort(Number(rest[0]));out(bridge('dashboard-config',{port:Number(rest[0])}));if(before.dashboard.enabled)system(['dashboard-restart']);info('Dashboard: http://localhost:'+Number(rest[0]));}
+      else if(['enable','disable','start','stop','restart','status'].includes(action)){count(rest,0);if(action==='enable'||action==='disable')bridge('dashboard-config',{enabled:action==='enable'});system(['dashboard-'+action]);}
+      else throw new Error('Run hostman help for dashboard commands.');break;
+    }
+    case 'uninstall':count(tail,0);await uninstall(flags);break;
     case 'update':count(tail,0);await update(flags);break;
     default:throw new Error('Unknown command. Run hostman help.');
   }
@@ -160,8 +190,8 @@ async function menu(){
   const yes=async prompt=>['y','yes'].includes((await ask(prompt+' [y/N] ')).toLowerCase());
   try {
     while(true){
-      console.log('\n'+paint(36,'╭─ HOSTMAN · ByDT Softwares ─╮'));
-      console.log(' 1 List hosts        2 Add host         3 Edit host\n 4 Remove host       5 Toggle host      6 Groups\n 7 Edit hosts file   8 Export JSON      9 Import JSON\n10 Backups/restore  11 DNS menu        12 Doctor\n13 Update           0 Exit');
+      console.log(banner(pkg.version));
+      console.log(' 1 List hosts        2 Add host         3 Edit host\n 4 Remove host       5 Toggle host      6 Groups\n 7 Edit hosts file   8 Export JSON      9 Import JSON\n10 Backups/restore  11 DNS menu        12 Doctor\n13 Update          14 DNS setup       15 Dashboard\n16 Uninstall        0 Exit');
       try {
         const choice=await ask('hostman › ');
         if(choice==='0'||choice.toLowerCase()==='exit')break;
@@ -185,13 +215,17 @@ async function menu(){
         else if(choice==='9'){const file=await ask('Input JSON path: ');if(await yes('Replace all managed entries and DNS config?'))await execute(['import',file,'--yes']);}
         else if(choice==='10'){await execute(['backups']);const id=await ask('Backup ID to restore (Enter to return): ');if(id && await yes('Restore the ENTIRE hosts file and managed config?'))await execute(['restore',id,'--yes']);}
         else if(choice==='11'){
+          if(!bridge('export').setupComplete)await dnsSetup(rl);
           console.log('DNS mode puts Hostman before router DNS. Set reachable upstream servers first.');
-          const action=await ask('status / enable / disable / start / stop / restart / upstream (Enter to return): ');if(!action)continue;
-          if(!['status','enable','disable','start','stop','restart','upstream'].includes(action))throw new Error('Unknown DNS action.');
+          const action=await ask('status / enable / disable / start / stop / restart / upstream / blocks (Enter to return): ');if(!action)continue;
+          if(!['status','enable','disable','start','stop','restart','upstream','blocks'].includes(action))throw new Error('Unknown DNS action.');
           if(action==='enable'&&!await yes('Enable local DNS priority and change system DNS settings?'))continue;
           await execute(['dns',action,...(action==='upstream'?(await ask('Upstream IPs separated by spaces: ')).split(/\s+/):[])]);
         } else if(choice==='12')await doctor();
-        else if(choice==='13'){if(await yes('Download and install the latest code from the official GitHub repo?'))await update({yes:true});}
+        else if(choice==='13'){if(await yes('Download and install the latest GitHub Release ZIP?'))await update({yes:true});}
+        else if(choice==='14')await dnsSetup(rl);
+        else if(choice==='15'){const action=await ask('status / enable / disable / start / stop / restart / port: ');await execute(['dashboard',action,...(action==='port'?[await ask('Dashboard port: ')]:[])]);}
+        else if(choice==='16'){if(await yes('Uninstall Hostman and restore system DNS?')){await uninstall({yes:true});break;}}
         else console.log('Choose a number from the menu.');
       } catch(e){console.log(paint(31,'Error: '+e.message));}
     }

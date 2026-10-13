@@ -42,7 +42,8 @@ def group(value):
 
 def defaults():
     return {'schema': 1, 'groups': {'default': True}, 'entries': [],
-            'dns': {'upstreams': ['1.1.1.1', '9.9.9.9'], 'ttl': 60, 'timeoutMs': 1500}}
+            'dns': {'upstreams': ['1.1.1.1', '9.9.9.9'], 'ttl': 60, 'timeoutMs': 1500, 'blocks': [], 'logging': True},
+            'dashboard': {'enabled': False, 'port': 8090}, 'setupComplete': False}
 
 def validate(data):
     if not isinstance(data, dict) or data.get('schema') != 1:
@@ -68,7 +69,22 @@ def validate(data):
         ids.add(e['id'])
         if not isinstance(e.get('comment', ''), str) or any(c in e.get('comment', '') for c in '\r\n\0'):
             raise ValueError('Comments must be a single line.')
+    data.setdefault('dashboard', {'enabled': False, 'port': 8090})
+    data.setdefault('setupComplete', False)
+    panel = data['dashboard']
+    if not isinstance(panel, dict) or type(panel.get('enabled')) is not bool or type(panel.get('port')) is not int or not 1024 <= panel['port'] <= 65535:
+        raise ValueError('Dashboard port must be 1024–65535 and enabled must be boolean.')
+    if type(data['setupComplete']) is not bool: raise ValueError('Invalid setup flag.')
     dns = data.get('dns', {})
+    dns.setdefault('blocks', [])
+    dns.setdefault('logging', True)
+    if type(dns['logging']) is not bool or not isinstance(dns['blocks'], list) or len(dns['blocks']) > 1000:
+        raise ValueError('Invalid DNS logging/block settings.')
+    clean=[]
+    for rule in dns['blocks']:
+        if not isinstance(rule,str): raise ValueError('DNS blocks must be hostname strings.')
+        clean.append(('*.' if rule.startswith('*.') else '') + domain(rule[2:] if rule.startswith('*.') else rule))
+    dns['blocks']=sorted(set(clean))
     servers = dns.get('upstreams')
     if not isinstance(servers, list) or not 1 <= len(servers) <= 5:
         raise ValueError('Set 1–5 upstream IP addresses.')
@@ -225,7 +241,8 @@ def dispatch(request):
         if op == 'recover': return {'message': 'Recovery complete.'}
         if op == 'init':
             if not hosts.exists(): raise ValueError('System hosts file is missing.')
-            if not (root / 'state.json').exists(): atomic(root / 'state.json', (json.dumps(data, indent=2)+'\n').encode())
+            # Persist missing v1.2 defaults when upgrading an existing schema-1 state.
+            atomic(root / 'state.json', (json.dumps(data, indent=2)+'\n').encode())
             return {'message': 'Hostman initialized.'}
         if op == 'add':
             host = domain(request['host'])
@@ -261,7 +278,21 @@ def dispatch(request):
                         if e['group'] == name: e['group'] = new
                 else: raise ValueError('Unknown group action.')
         elif op == 'import': data = validate(request['data'])
-        elif op == 'dns-config': data['dns']['upstreams'] = request['upstreams']
+        elif op == 'dns-config':
+            for key in ('upstreams','ttl','timeoutMs','logging'):
+                if key in request: data['dns'][key] = request[key]
+        elif op in ('dns-block','dns-unblock'):
+            rule=request['domain']
+            rule=('*.' if rule.startswith('*.') else '') + domain(rule[2:] if rule.startswith('*.') else rule)
+            rules=data['dns'].setdefault('blocks',[])
+            if op=='dns-block' and rule not in rules: rules.append(rule)
+            elif op=='dns-unblock':
+                if rule not in rules: raise ValueError('No blocking rule matches '+rule)
+                rules.remove(rule)
+        elif op == 'dashboard-config':
+            for key in ('enabled','port'):
+                if key in request: data['dashboard'][key]=request[key]
+            if 'setupComplete' in request: data['setupComplete']=request['setupComplete']
         elif op == 'clear': data['entries'] = []
         elif op == 'restore':
             name = request['name']

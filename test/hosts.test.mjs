@@ -116,3 +116,15 @@ test('foreground CLI DNS reloads a hosts edit without restarting',async()=>{
     assert.deepEqual(reply.subarray(-4),Buffer.from([10,0,0,2]));
   }finally{if(child){child.kill();await new Promise(r=>child.once('exit',r));}s.close();}
 });
+
+test('v1.0 state migrates DNS/controller defaults and validates new settings',()=>{
+  const s=sandbox();try{
+    ok(s.request('init'));const file=join(s.dir,'data/state.json');const old=JSON.parse(readFileSync(file,'utf8'));delete old.dashboard;delete old.setupComplete;delete old.dns.blocks;delete old.dns.logging;writeFileSync(file,JSON.stringify(old));
+    ok(s.request('init'));const migrated=JSON.parse(readFileSync(file,'utf8'));assert.equal(migrated.dashboard.port,8090);assert.equal(migrated.dashboard.enabled,false);assert.deepEqual(migrated.dns.blocks,[]);assert.equal(migrated.setupComplete,false);
+    ok(s.request('dns-block',{domain:'*.Example.test'}));assert.deepEqual(ok(s.request('export')).dns.blocks,['*.example.test']);
+    ok(s.request('dns-config',{ttl:30,timeoutMs:2000,logging:false}));assert.equal(ok(s.request('export')).dns.logging,false);
+    assert.equal(s.request('dashboard-config',{port:53}).ok,false);ok(s.request('dashboard-config',{port:8091,enabled:false,setupComplete:true}));assert.equal(ok(s.request('export')).dashboard.port,8091);
+    ok(s.request('dns-unblock',{domain:'*.example.test'}));assert.deepEqual(ok(s.request('export')).dns.blocks,[]);
+    const cli=spawnSync(process.execPath,[join(root,'bin/hostman.mjs'),'uninstall','--yes'],{env:s.env,encoding:'utf8'});assert.equal(cli.status,1);assert.match(cli.stderr,/test path overrides/);
+  }finally{s.close();}
+});

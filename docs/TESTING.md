@@ -1,73 +1,67 @@
-# Verification report
+# Hostman 1.2.0 verification
 
-Hostman 1.0.0 was verified in a Linux container using Node.js 24.19.0 and Python
-3.12.14. All **15 automated integration tests passed**. No real hosts or system
-DNS settings were changed during verification.
+Verified with Node.js 24.19.0 and Python 3.12.14. **27 automated tests passed**.
+No real system hosts, DNS settings, user passwords or OS accounts were changed.
 
-## Automated checks
+The tests cover:
 
-- Hosts CRUD, IPv4 and IPv6, case normalization, enable/disable and group rename.
-- Preservation of unmanaged entries, comments and CRLF content.
-- Validation of duplicate names, invalid IPs, line injection and corrupt markers.
-- Backup/restore of full hosts and managed state.
-- Recovery from a simulated interrupted transaction.
-- Optimistic conflict detection when editing the full file.
-- Twelve concurrent Python writers without lost updates.
-- Real CLI add, list, export, clear and import commands against sandbox paths.
-- Refusal of system DNS edits with sandbox overrides and updates before install.
-- Real UDP/TCP A/AAAA queries, local NODATA and hot reload.
-- Upstream response ID checks and preservation of client IDs.
-- Retry through a second upstream when the first is silent.
-- TCP retry when an upstream sends a truncated UDP response.
-- Large UDP response truncation and complete TCP responses.
-- IPv6 loopback sockets and malformed DNS packets.
-- The actual foreground CLI DNS process reloads edited hosts without a restart.
+- Hosts CRUD, groups, enable/disable, IPv4/IPv6, validation and existing-entry preservation.
+- CRLF content, backups, interrupted-edit recovery, editor conflicts and concurrent writes.
+- v1.0 schema-1 migration to DNS/controller defaults; blocking and dashboard setting validation.
+- Sandbox refusal of uninstall and global DNS changes.
+- UDP/TCP DNS, IPv6 loopback, reload, upstream failover, spoofed IDs and truncated responses.
+- Exact/wildcard NXDOMAIN blocking and query metrics.
+- Old wrapper migration (reverse links, hard links, loops, same-target links), repeat installs.
+- Mocked NetworkManager/systemd-resolved restoration and rollback, including old Fedora snapshots.
+- Latest Release ZIP selection, ambiguous/absent assets, version comparison and missing Release errors.
+- Safe ZIP extraction: normal/wrapped projects, path traversal, symlinks, duplicate names and completeness.
+- Dashboard port-conflict validation before changing settings.
+- Dashboard login/session/logout, CSRF, same-origin requests, fixed actions, injection refusal and rate limits.
+- Empty-credential refusal and a real native C/Python PAM conversation ABI test with a fake PAM library.
+  The native ABI check uses gcc when available and skips that subtest otherwise.
 
-Shell scripts and Python/JavaScript files were syntax-checked. The generated
-systemd unit was checked with systemd-analyze verify against a temporary service
-path, substituting this container's Node executable for Fedora's `/usr/bin/node`. The checks do not start the service or apply networking changes.
+Additional DOM interaction checks exercised the actual dashboard JavaScript over
+its HTTP API with a disposable fake authentication provider: login, record/group
+creation, tab navigation, blocking, resets and logout passed with no script errors.
+That provider exists only in test/QA scaffolding; the installed service uses the
+OS-password helper. The browser preview could not be reached from this environment,
+so a visual browser review remains a platform smoke-test item.
 
-## Platform checks still required
+Python, JavaScript, shell scripts and the embedded bootstrap Python were
+syntax-checked. PowerShell scripts parsed with PowerShell 7.6.6 on Linux. NSIS 3.09
+compiled the Windows installer; its Windows PE header and administrator manifest
+were checked. The systemd unit was checked using a temporary local Node path.
+The EXE is unsigned. No signing certificate was supplied.
 
-This container is **not a Fedora desktop** and has **no Windows/PowerShell
-runtime**. The following require real disposable VMs before publishing a stable
-release. The GitHub updater also needs the source published in the supplied repo
-and working GitHub connectivity; no live update or push was performed here.
+## Real-machine smoke tests still required
 
-### Fedora VM
+This runtime is not a Fedora desktop or a Windows system. Passing these checks
+is not a live OS-password, Task Scheduler, systemd/network or uninstall test.
 
-1. Record `/etc/resolv.conf`, its symlink target and NetworkManager DNS config.
-2. Install with `sudo bash setup-fedora.sh`; confirm both PATH aliases.
-3. Use `sudo hostman` to create/edit a test mapping and a group.
-4. Set a reachable upstream, enable DNS, and check `getent hosts website.test`.
-5. Verify `hostman dns lookup website.test --tcp` and `--type AAAA`.
-6. Resolve an ordinary public hostname; check NetworkManager's nameserver list.
-7. Reboot and verify DNS priority, then stop/restart the service.
-8. Disable DNS and compare the saved prior resolver settings.
-9. Simulate a port-53 conflict and confirm enable rolls back without redirecting.
-10. Test updating to a second trusted tag, then the rollback path with a bad DNS
-    release. Confirm entries/backups persist.
-11. Check SELinux enforcing operation and non-root inability to edit protected
-    state/hosts. Uninstall and verify DNS restoration and retained backups.
+### Fedora / Ubuntu
 
-### Windows 10/11 VM
+1. Install the ZIP or publish a test stable Release and use linux-installer.sh.
+2. Confirm hosts/groups survive migration from v1.0/v1.1 and both PATH aliases work.
+3. Run `sudo hostman dns setup`, choose the dashboard, and check localhost:8090.
+4. Sign in with a real wheel/sudo account password; reject incorrect and non-admin accounts.
+5. Add/edit/toggle/delete a record/group; verify DNS answers and query activity.
+6. Set upstreams, TTL, timeout and logging. Check exact/wildcard blocking and logging-off behavior.
+7. Use enable/disable/restart/cache controls, then compare restored OS DNS to its saved state.
+8. Test Fedora NetworkManager, Ubuntu Desktop NetworkManager and Ubuntu Server systemd-resolved.
+9. Change the controller port, check conflicts, restart/reboot and verify preserved configuration.
+10. Upload a newer full ZIP to Latest and check update, active DNS/controller restart and state retention.
+11. Run `hostman uninstall`; verify DNS restoration, unit/PAM/PATH cleanup and retained backups.
+12. Check Fedora SELinux enforcing operation and inability of normal users to edit protected data/app files.
 
-1. Record current static/automatic DNS for every active IPv4/IPv6 adapter.
-2. Install as Administrator with a path containing spaces; open a new terminal
-    and check both PATH aliases.
-3. Confirm standard users can list but cannot edit hosts, state or application
-    files. Test Notepad editing and snapshot restore.
-4. Enable DNS. Check the startup task runs as SYSTEM and listeners bind only to
-    127.0.0.1 and ::1, TCP/UDP 53.
-5. Resolve a local mapping with `Resolve-DnsName website.test` and a public name;
-    test `hostman dns lookup ipv6.test --type AAAA --tcp`.
-6. Reboot and check the task restarts correctly. Disable DNS; confirm both static
-    and DHCP DNS settings are restored for each family.
-7. Connect another adapter, rerun enable, and confirm it is included. Test the
-    disconnected-adapter recovery message.
-8. Check task restart after a crash and port-53 conflict handling.
-9. Update across two trusted tags; confirm task restart, state preservation and
-    application rollback. Uninstall and inspect restored DNS and retained state.
+### Windows 10/11
 
-Use disposable VMs for system integration; automated tests intentionally never
-need administrator privileges or modify global networking.
+1. Run windows-installer.exe; test both existing prerequisites and WinGet dependency installation.
+2. Open a fresh Administrator terminal; check aliases and run the DNS setup wizard.
+3. Sign in with a real Administrators account password (not Hello PIN), including an account with UAC.
+4. Reject incorrect/non-admin credentials; check native LogonUser authorization and account variants.
+5. Exercise records, groups, wildcard blocks, metrics, upstream configuration and DNS priority restoration.
+6. Change the port, test conflicts, reboot and check the independent DNS/controller tasks.
+7. Verify SYSTEM finds the protected Python pointer and query logs are inaccessible to standard users.
+8. Perform a live latest-Release update; verify tasks and preferences survive and the previous app is retained.
+9. Uninstall from the CLI and Installed Apps; confirm restored IPv4/IPv6 static/DHCP DNS and task/PATH cleanup.
+10. Confirm the ByDT theme on desktop/mobile sizes and browser focus, validation and session-expiry behavior.
